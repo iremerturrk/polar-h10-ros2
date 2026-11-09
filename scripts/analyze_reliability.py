@@ -44,7 +44,7 @@ for topic in ['ecg', 'acc']:
     big = gaps > 1.5 * expected
     lost = int(np.sum(np.round(gaps[big] / expected[big]) - 1))
     print(f'{topic}: {len(d)} frames, sensor frame interval {gaps.min() / 1e6:.1f} to {gaps.max() / 1e6:.1f} ms, '
-          f'gaps: {int(big.sum())}, estimated lost frames: {lost}')
+          f'gaps: {int(big.sum())}, estimated lost frames: {lost}, duplicates: {int(np.sum(gaps == 0))}')
 
 hr = df[df.topic == 'hr']
 hr_gaps = np.diff(hr.recv_ns.values) / 1e9

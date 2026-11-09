@@ -43,6 +43,9 @@ class PolarH10Node(Node):
         self.control_event = None
         self.disconnected = None
         self.last_response = None
+        self.session = 0                                   # current connection session
+        self.last_ts = {ECG_TYPE: -1, ACC_TYPE: -1}        # last published sensor timestamp
+        self.reconnects = 0
 
         self.ble_thread = threading.Thread(target=self.run_ble, daemon=True)
         self.ble_thread.start()
@@ -60,11 +63,30 @@ class PolarH10Node(Node):
             except Exception:
                 pass
 
+    def log(self, level, text):
+        # rclpy requires a fixed severity per call site, so one line per level
+        if not rclpy.ok():
+            return
+        logger = self.get_logger()
+        if level == 'info':
+            logger.info(text)
+        elif level == 'warn':
+            logger.warning(text)
+        else:
+            logger.error(text)
+
     async def sleep_or_stop(self, seconds):
         try:
             await asyncio.wait_for(self.stop_event.wait(), timeout=seconds)
         except asyncio.TimeoutError:
             pass
+
+    def guarded(self, callback, sid):
+        """Only forward notifications that belong to the current session."""
+        def wrapper(sender, data):
+            if sid == self.session:
+                callback(sender, data)
+        return wrapper
 
     # ---------- BLE thread ----------
 
@@ -73,8 +95,12 @@ class PolarH10Node(Node):
         asyncio.set_event_loop(self.loop)
         self.stop_event = asyncio.Event()
         self.control_event = asyncio.Event()
-        self.loop.run_until_complete(self.ble_main())
-        self.loop.close()
+        try:
+            self.loop.run_until_complete(self.ble_main())
+        except Exception as e:
+            self.log('error', f'BLE thread crashed: {type(e).__name__}: {e}')
+        finally:
+            self.loop.close()
 
     def stop(self):
         if self.loop is not None and self.stop_event is not None:
@@ -90,25 +116,32 @@ class PolarH10Node(Node):
             try:
                 await self.stream(client)
             except Exception as e:
-                self.get_logger().error(f'Streaming error: {type(e).__name__}: {e}')
+                self.log('error', f'Streaming error: {type(e).__name__}: {e}')
             finally:
+                self.session += 1          # invalidate callbacks of this connection
                 if client.is_connected:
                     try:
                         for mtype in (ECG_TYPE, ACC_TYPE):
                             await client.write_gatt_char(PMD_CONTROL, bytearray([0x03, mtype]), response=True)
-                        await client.disconnect()
+                        for uuid in (PMD_DATA, HR_UUID, PMD_CONTROL):
+                            await client.stop_notify(uuid)
                     except Exception:
                         pass
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
             if not self.stop_event.is_set():
-                self.get_logger().warn('Disconnected. Reconnecting in 2 s...')
+                self.reconnects += 1
+                self.log('warn', f'Disconnected (#{self.reconnects}). Reconnecting in 2 s...')
                 await self.sleep_or_stop(2)
-        self.get_logger().info('BLE loop stopped')
+        self.log('info', 'BLE loop stopped')
 
     async def connect(self):
-        self.get_logger().info(f'Scanning for {self.mac}...')
+        self.log('info', f'Scanning for {self.mac}...')
         device = await BleakScanner.find_device_by_address(self.mac, timeout=15)
         if device is None:
-            self.get_logger().warn('Polar H10 not found (strap on and wet? phone Bluetooth off?)')
+            self.log('warn', 'Polar H10 not found (strap on and wet? phone Bluetooth off?)')
             return None
         self.disconnected = asyncio.Event()
         client = BleakClient(device, timeout=20,
@@ -116,9 +149,9 @@ class PolarH10Node(Node):
         try:
             await client.connect()
         except Exception as e:
-            self.get_logger().warn(f'Connection failed: {type(e).__name__}')
+            self.log('warn', f'Connection failed: {type(e).__name__}')
             return None
-        self.get_logger().info(f'Connected to {device.name}')
+        self.log('info', f'Connected to {device.name}')
         return client
 
     async def send_command(self, client, payload, label):
@@ -129,15 +162,16 @@ class PolarH10Node(Node):
         status = resp[3] if len(resp) > 3 else -1
         if status != 0:
             raise RuntimeError(f'{label} failed with status {status}')
-        self.get_logger().info(f'{label}: OK')
+        self.log('info', f'{label}: OK')
 
     async def stream(self, client):
-        await client.start_notify(PMD_CONTROL, self.on_control)
-        await client.start_notify(HR_UUID, self.on_hr)
-        await client.start_notify(PMD_DATA, self.on_pmd)
+        sid = self.session
+        await client.start_notify(PMD_CONTROL, self.guarded(self.on_control, sid))
+        await client.start_notify(HR_UUID, self.guarded(self.on_hr, sid))
+        await client.start_notify(PMD_DATA, self.guarded(self.on_pmd, sid))
         await self.send_command(client, build_start(ECG_TYPE, {0: ECG_FS, 1: 14}), 'Start ECG')
         await self.send_command(client, build_start(ACC_TYPE, {0: self.acc_fs, 1: 16, 2: self.acc_range}), 'Start ACC')
-        self.get_logger().info('Streaming HR, RR, ECG and ACC')
+        self.log('info', 'Streaming HR, RR, ECG and ACC')
 
         stop_task = asyncio.ensure_future(self.stop_event.wait())
         disc_task = asyncio.ensure_future(self.disconnected.wait())
@@ -180,6 +214,11 @@ class PolarH10Node(Node):
         ts = int.from_bytes(data[1:9], 'little')
         ftype = data[9]
         payload = data[10:]
+
+        if mtype in self.last_ts:
+            if ts <= self.last_ts[mtype]:
+                return                      # duplicate or out-of-order frame
+            self.last_ts[mtype] = ts
 
         if mtype == ECG_TYPE and ftype == 0x00:
             msg = ECG()
