@@ -1,0 +1,18 @@
+# personal physiological recordings: never commit
+recordings/
+reliability/
+bags/
+*.csv
+*.png
+
+# Python
+__pycache__/
+*.pyc
+
+# ROS build output
+build/
+install/
+log/
+
+# virtual environments
+*_venv/
